@@ -1,8 +1,8 @@
 # par2proxy
 
-**par2proxy** is a Docker service that sits between Sonarr/Radarr and Decypharr. It acts as a fake SABnzbd download client, intercepts NZB submissions, fetches par2 recovery data, fixes missing or corrupt segments, then forwards the repaired NZB to Decypharr for streaming.
+**par2proxy** sits between Sonarr/Radarr and Decypharr. It acts as a fake SABnzbd download client, intercepts NZB submissions, fetches par2 recovery data via NNTP, fixes missing segments, then forwards the repaired NZB to Decypharr for streaming.
 
-**It never downloads the media files.** Only par2 data (~1–5% of the total NZB size) is fetched.
+**It never downloads the media files.** Only par2 data is fetched (~1–5% of the NZB size).
 
 ---
 
@@ -10,224 +10,171 @@
 
 ```
 Sonarr/Radarr
-    │  NZB submission (SABnzbd API)
+    │  NZB (SABnzbd API)
     ▼
 par2proxy :8383
-    │
-    ├─ 1. Fetches par2 index + vol files via NNTP
-    ├─ 2. STATs every media segment (no download, just presence check)
-    ├─ 3. Rewrites NZB: missing segment IDs → par2 recovery article IDs
-    │
-    │  Repaired NZB (SABnzbd API)
+    │  1. Fetches par2 data via NNTP
+    │  2. If Decypharr reports missing segments → substitutes them with recovery blocks
+    │  3. Forwards repaired NZB
     ▼
 Decypharr :8282
-    │
-    └─ Streams media via NNTP as normal
-       Symlink lives in /mnt/decypharr/sonarr/ (or wherever Decypharr mounts)
+    │  Streams media via NNTP
+    ▼
+/mnt/downloads/sonarr/   (symlink)
 ```
 
-par2proxy polls Decypharr until the job is fully complete before reporting success to Sonarr, so imports always have the files ready.
+par2proxy polls Decypharr until the job completes, then reports success to Sonarr so the import always has files ready.
 
 ---
 
-## Quick start
+## Deploy
 
 ```bash
-git clone https://github.com/yourname/par2proxy
+# Extract the tar
+tar -xzf par2proxy.tar.gz
 cd par2proxy
-cp docker-compose.yml docker-compose.override.yml
-# Edit docker-compose.override.yml with your credentials
-docker compose up -d --build
+
+# Start (uses pre-built binary — no Go needed)
+docker-compose up -d --build
+
+# Open the web UI to configure everything
+open http://localhost:8383
 ```
 
-Open **http://localhost:8383** to see the dashboard.
+> **Note:** Uses a pre-built `linux/amd64` binary in the tar. The Dockerfile is a single-stage Alpine image — no multi-stage build — which avoids the `ContainerConfig` crash in docker-compose v1.29.2.
 
 ---
 
-## Sonarr / Radarr setup
+## First-run setup
+
+On first start, open **http://your-host:8383** and go to **Settings**. Fill in:
+
+### par2proxy
+| Field | Description |
+|---|---|
+| **API key** | Any string — put this same value in Sonarr/Radarr's download client API key field |
+| **Max par2 fetch (MB)** | How much par2 data to fetch per NZB. Default 100 MB. |
+
+### Sonarr / Radarr
+Add one entry per arr. Each needs:
+
+| Field | Example | Description |
+|---|---|---|
+| **Name** | `Sonarr` | Display label |
+| **URL** | `http://sonarr:8989` | Arr host URL |
+| **API key** | `abc123...` | From Sonarr → Settings → General → API Key |
+| **Category** | `sonarr` | Subfolder under Decypharr's complete dir. Must match what you set in the arr's download client. |
+
+> These credentials are forwarded to Decypharr's SABnzbd API so it knows which arr sent the NZB.
+
+### Decypharr
+| Field | Description |
+|---|---|
+| **URL** | `http://decypharr:8282` |
+| **API token** | From Decypharr → Settings → Auth (Bearer token — only needed for the repair library sweep feature) |
+
+### NNTP providers
+Add your Usenet provider(s). Each has host, port, username, password, TLS toggle, and max connections. Click **Test** to verify auth before saving.
+
+Click **Save settings** — config is written to `/docker/par2proxy/config/config.json` and persists across restarts.
+
+---
+
+## Sonarr / Radarr download client settings
 
 **Settings → Download Clients → + → SABnzbd**
 
-| Field    | Value                              |
-|----------|------------------------------------|
-| Name     | par2proxy                          |
-| Host     | `par2proxy` (or your host IP)      |
-| Port     | `8383`                             |
-| API Key  | value of `API_KEY` env var         |
-| Category | `sonarr` (or `radarr`)             |
-| URL Base | *(leave empty)*                    |
+| Field | Value |
+|---|---|
+| **Host** | `par2proxy` (container name) or your host IP |
+| **Port** | `8383` |
+| **API Key** | Must match what you set in par2proxy Settings → API key |
+| **Category** | `sonarr` (or `radarr`) — must match the category in par2proxy's arr config |
+| **URL Base** | *(leave empty)* |
 
 Click **Test** → **Save**.
 
-Set par2proxy at **higher priority** than any direct Decypharr download client so it gets first pick of Usenet NZBs.
-
 ---
 
-## Environment variables
+## What par2proxy can and can't fix
 
-### This service
+**Can fix:** NZBs where some media segments are missing but the par2 recovery files are still on Usenet. The par2 data is used to substitute missing segment IDs with recovery block IDs, which Decypharr streams instead.
 
-| Variable        | Default        | Description                                  |
-|-----------------|----------------|----------------------------------------------|
-| `LISTEN_ADDR`   | `:8383`        | Address par2proxy binds to                   |
-| `API_KEY`       | `par2proxy`    | SABnzbd API key that Sonarr uses to auth here |
-
-### Decypharr connection
-
-| Variable                | Default                   | Description                                                      |
-|-------------------------|---------------------------|------------------------------------------------------------------|
-| `DECYPHARR_URL`         | `http://decypharr:8282`   | Decypharr base URL                                               |
-| `DECYPHARR_API_KEY`     | *(empty)*                 | Decypharr Bearer token — from Settings → Auth. Used for REST API (`/api/repair/health`, `/api/browse/`) and for fetching `complete_dir` at startup |
-| `DECYPHARR_USERNAME`    | *(empty)*                 | Your Arr host URL, e.g. `http://sonarr:8989` (Decypharr SABnzbd docs) |
-| `DECYPHARR_PASSWORD`    | *(empty)*                 | Your Arr API token (Decypharr SABnzbd docs)                      |
-
-> **Note on `DECYPHARR_API_KEY`:** at startup par2proxy calls `GET /sabnzbd/api?mode=config` to fetch the real `complete_dir` from Decypharr, retrying every 5 seconds for up to 50 seconds. This means Docker Compose startup order doesn't matter — Decypharr just needs to be up before the first NZB arrives.
-
-### NNTP providers
-
-**Single provider:**
-
-| Variable           | Default | Description               |
-|--------------------|---------|---------------------------|
-| `NNTP_HOST`        | —       | NNTP hostname (required)  |
-| `NNTP_PORT`        | `563`   | NNTP port                 |
-| `NNTP_USER`        | —       | NNTP username (required)  |
-| `NNTP_PASS`        | —       | NNTP password (required)  |
-| `NNTP_TLS`         | `true`  | Use TLS                   |
-| `NNTP_CONNECTIONS` | `8`     | Max connections — keep below Decypharr's limit |
-
-**Multiple providers** (failover, tried in order):
-
-```env
-NNTP_0_HOST=news.newshosting.com
-NNTP_0_PORT=563
-NNTP_0_USER=user1
-NNTP_0_PASS=pass1
-NNTP_0_CONNECTIONS=8
-
-NNTP_1_HOST=news.eweka.nl
-NNTP_1_PORT=563
-NNTP_1_USER=user2
-NNTP_1_PASS=pass2
-NNTP_1_CONNECTIONS=4
-```
-
-### Behaviour
-
-| Variable       | Default | Description                                          |
-|----------------|---------|------------------------------------------------------|
-| `MAX_PAR2_MB`  | `100`   | Max MB of par2 data to fetch per NZB                 |
-| `VERBOSE`      | `false` | Verbose logging                                      |
+**Cannot fix:** NZBs where the par2 files themselves have also expired (old releases, typically 5+ years). In this case the error will say `release has missing/expired segments — par2 repair not possible`. Find a fresher re-encode or different indexer source.
 
 ---
 
 ## Web UI
 
-Open **http://par2proxy:8383/** to see:
+Open **http://par2proxy:8383/**
 
-- **Queue** — active NZB jobs with repair progress, bad/fixed segment counts
-- **History** — completed and failed jobs
-- **Repair library** — bulk repair of Decypharr's existing usenet library
-- **NNTP providers** — live connection status per provider
+| Tab | Description |
+|---|---|
+| **Queue** | Active NZB jobs — shows phase (Checking par2, Downloading %, etc.), bad/fixed segment counts |
+| **History** | Completed and failed jobs |
+| **Repair library** | Bulk repair of Decypharr's existing library |
+| **NNTP providers** | Live connection status — click Recheck to test now |
+| **Settings** | Configure all connections |
 
-### Repair library tab
-
-Three actions:
+### Repair library
 
 | Button | What it does |
-|--------|-------------|
-| **Scan broken** | Calls `GET /api/repair/health?status=broken` on Decypharr and lists what it already knows is broken — no repair yet |
-| **Repair all** | Starts a full sweep: fetches par2 data for every broken entry, rewrites its NZB, resubmits through par2proxy → Decypharr |
-| **Decypharr sweep** | Triggers `POST /api/repair/run` on Decypharr directly — its own built-in health checker (faster, no par2 fetch) |
+|---|---|
+| **Scan broken** | Queries Decypharr's repair health API and lists broken entries |
+| **Repair all** | Fetches par2 for each broken entry, rewrites NZBs, resubmits |
+| **Decypharr sweep** | Triggers Decypharr's own built-in repair run |
 
 ---
 
-## API endpoints
+## Files
 
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/sabnzbd/api?mode=addfile` | Submit NZB (Sonarr/Radarr) |
-| `GET`  | `/sabnzbd/api?mode=queue`   | Queue status |
-| `GET`  | `/sabnzbd/api?mode=history` | Completed jobs |
-| `GET`  | `/api/status`               | JSON status for web UI |
-| `POST` | `/api/sweep/start`          | Start library sweep |
-| `POST` | `/api/sweep/stop`           | Cancel sweep |
-| `GET`  | `/api/sweep/status`         | Live sweep progress |
-| `GET`  | `/api/sweep/broken`         | Broken entries from Decypharr |
-| `POST` | `/api/sweep/decypharr`      | Trigger Decypharr's built-in repair |
-| `GET`  | `/health`                   | Health check → `ok` |
-
----
-
-## Docker Compose example
-
-```yaml
-services:
-  par2proxy:
-    build: .
-    container_name: par2proxy
-    restart: unless-stopped
-    ports:
-      - "8383:8383"
-    environment:
-      LISTEN_ADDR: ":8383"
-      API_KEY: "changeme"
-
-      DECYPHARR_URL: "http://decypharr:8282"
-      DECYPHARR_API_KEY: "your-decypharr-api-token"
-      DECYPHARR_USERNAME: "http://sonarr:8989"
-      DECYPHARR_PASSWORD: "your-sonarr-api-token"
-
-      NNTP_HOST: "news.newshosting.com"
-      NNTP_PORT: "563"
-      NNTP_USER: "your-username"
-      NNTP_PASS: "your-password"
-      NNTP_TLS: "true"
-      NNTP_CONNECTIONS: "8"
-
-      MAX_PAR2_MB: "100"
-      VERBOSE: "false"
-    networks:
-      - arr-net
-
-networks:
-  arr-net:
-    external: true
+```
+/docker/par2proxy/config/config.json   ← saved settings (bind-mounted into container)
 ```
 
----
-
-## Decypharr config note
-
-Keep `skip_repair: false` in Decypharr's usenet config. par2proxy ensures recovery article IDs are present in the NZB; Decypharr's native repair layer does the Reed-Solomon reconstruction during streaming.
-
-```json
-{
-  "usenet": {
-    "skip_repair": false
-  }
-}
-```
+Settings saved from the web UI persist here across container restarts and rebuilds.
 
 ---
 
-## Building from source
+## Rebuilding from source
+
+If you have Go 1.22+ installed:
 
 ```bash
-go build -o par2proxy ./cmd/par2proxy
-./par2proxy
+cd par2proxy
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -ldflags="-s -w" -o par2proxy ./cmd/par2proxy
+docker-compose up -d --build
 ```
 
-Requires Go 1.22+. No external dependencies — pure stdlib.
+No external dependencies — pure Go stdlib.
 
 ---
 
-## Health check
+## Troubleshooting
 
+**docker-compose `ContainerConfig` error:**
 ```bash
-curl http://localhost:8383/health
-# → ok
+docker rm -f par2proxy
+docker-compose up -d --build
 ```
+This is a docker-compose v1.29.2 bug triggered by recreating an existing container. Removing it first clears the bad metadata.
+
+**Sonarr test connection fails:**
+- URL Base must be **empty** in Sonarr's download client settings
+- API key must exactly match par2proxy Settings → API key
+- Check `docker logs par2proxy | grep sabnzbd` for the actual request
+
+**Files going to `/mnt/complete` instead of `/mnt/complete/sonarr`:**
+- Make sure the **Category** in par2proxy's arr config matches the **Category** in Sonarr's download client settings
+- Both must be the same string, e.g. `sonarr`
+
+**par2 fetch failing:**
+- Check NNTP providers tab — providers must show Online
+- Old releases (5+ years) often have expired par2 files — this is unrecoverable
+
+**Decypharr reports 500 / missing segments:**
+- par2proxy will automatically retry repair up to 5 times
+- If it still fails, the release has expired par2 data
 
 ---
 
@@ -235,23 +182,19 @@ curl http://localhost:8383/health
 
 ```
 par2proxy/
-├── cmd/par2proxy/       # main entrypoint
+├── cmd/par2proxy/       # main entrypoint, HTTP routing
 ├── internal/
-│   ├── config/          # environment + JSON config loading
-│   ├── nntp/            # pooled NNTP client with yEnc decode
-│   ├── nzb/             # NZB XML parser and marshaller
-│   ├── par2/            # PAR2 packet parser (IFSC checksums, recovery blocks)
-│   ├── repair/          # par2 repair engine: STAT segments, rewrite NZB
-│   ├── sabnzbd/         # fake SABnzbd HTTP API + Decypharr status polling
-│   ├── sweeper/         # bulk library repair via Decypharr REST API
-│   └── ui/              # embedded web dashboard (dashboard.html + JSON API)
+│   ├── config/          # JSON config + env var loading
+│   ├── nntp/            # pooled NNTP client, yEnc decode
+│   ├── nzb/             # NZB XML parser/marshaller
+│   ├── par2/            # PAR2 packet parser
+│   ├── repair/          # par2 repair engine
+│   ├── sabnzbd/         # fake SABnzbd API + Decypharr forwarding
+│   ├── settings/        # settings API (GET/POST + test endpoints)
+│   ├── sweeper/         # bulk library repair
+│   └── ui/              # embedded web dashboard
+├── par2proxy            # pre-built linux/amd64 binary
 ├── Dockerfile
 ├── docker-compose.yml
 └── README.md
 ```
-
----
-
-## License
-
-MIT
